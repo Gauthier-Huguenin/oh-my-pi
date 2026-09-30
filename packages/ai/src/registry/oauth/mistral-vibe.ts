@@ -20,19 +20,16 @@
  * (observed 2026-09-30: sustained traffic moved the plan's Vibe Code
  * counter, not the API credits counter).
  */
-import { createHash, randomBytes } from "node:crypto";
-
+import { isRecord, sleepLong } from "@oh-my-pi/pi-utils";
 import * as AIError from "../../error";
 import type { FetchImpl } from "../../types";
-import type { OAuthController, OAuthCredentials } from "./types";
+import { generatePKCE } from "./pkce";
+import type { OAuthController } from "./types";
 
 const AUTH_BASE_URL = "https://console.mistral.ai";
 const AUTH_API_BASE_URL = `${AUTH_BASE_URL}/api`;
 const SIGN_IN_PATH = "/vibe/sign-in";
-const POLL_INTERVAL_SECONDS = 3;
-// The console session is the authorizer; the minted key has no documented
-// expiry, so the credential outlives any OAuth window.
-const CREDENTIAL_EXPIRY_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+const POLL_INTERVAL_MS = 3000;
 
 type SignInProcess = {
 	processId: string;
@@ -49,10 +46,8 @@ type PollPayload = {
 
 /** Narrow a decoded JSON body at the network boundary, once per response. */
 function asRecord(value: unknown, message: string): Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		throw new AIError.OAuthError(`${message}: malformed JSON response`, { kind: "validation", provider: "mistral" });
-	}
-	return value as Record<string, unknown>;
+	if (isRecord(value)) return value;
+	throw new AIError.OAuthError(`${message}: malformed JSON response`, { kind: "validation", provider: "mistral" });
 }
 
 function requiredString(record: Record<string, unknown>, field: string, message: string): string {
@@ -88,26 +83,53 @@ async function readJson(response: Response, message: string): Promise<unknown> {
 	}
 }
 
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new AIError.LoginCancelledError("Login cancelled");
+}
+
+/** `fetch` bound to the login's abort signal; an abort surfaces as a cancelled login. */
+async function request(url: string, init: RequestInit, ctrl: OAuthController, fetchImpl: FetchImpl): Promise<Response> {
+	throwIfCancelled(ctrl.signal);
+	try {
+		return await fetchImpl(url, { ...init, signal: ctrl.signal });
+	} catch (error) {
+		throwIfCancelled(ctrl.signal);
+		throw error;
+	}
+}
+
 async function postJson(
 	url: string,
 	body: Record<string, string>,
+	ctrl: OAuthController,
 	fetchImpl: FetchImpl,
 	message: string,
 ): Promise<unknown> {
-	const response = await fetchImpl(url, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify(body),
-	});
+	const response = await request(
+		url,
+		{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+		ctrl,
+		fetchImpl,
+	);
 	return readJson(response, message);
 }
 
-async function startSignIn(codeChallenge: string, fetchImpl: FetchImpl): Promise<SignInProcess> {
+async function abortableSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+	try {
+		await sleepLong(ms, signal);
+	} catch (error) {
+		throwIfCancelled(signal);
+		throw error;
+	}
+}
+
+async function startSignIn(codeChallenge: string, ctrl: OAuthController, fetchImpl: FetchImpl): Promise<SignInProcess> {
 	const message = "Failed to start Mistral browser sign-in";
 	const payload = asRecord(
 		await postJson(
 			`${AUTH_API_BASE_URL}${SIGN_IN_PATH}`,
 			{ code_challenge: codeChallenge, code_challenge_method: "S256" },
+			ctrl,
 			fetchImpl,
 			message,
 		),
@@ -125,9 +147,9 @@ async function startSignIn(codeChallenge: string, fetchImpl: FetchImpl): Promise
 	};
 }
 
-async function pollSignIn(process: SignInProcess, fetchImpl: FetchImpl): Promise<PollPayload> {
+async function pollSignIn(process: SignInProcess, ctrl: OAuthController, fetchImpl: FetchImpl): Promise<PollPayload> {
 	const message = "Mistral sign-in status unavailable";
-	const response = await fetchImpl(process.pollUrl);
+	const response = await request(process.pollUrl, {}, ctrl, fetchImpl);
 	// The process is gone: 410 instead of a status payload.
 	if (response.status === 410) return { status: "expired" };
 	const payload = asRecord(await readJson(response, message), message);
@@ -155,11 +177,13 @@ async function pollSignIn(process: SignInProcess, fetchImpl: FetchImpl): Promise
 
 async function waitForCompletion(process: SignInProcess, ctrl: OAuthController, fetchImpl: FetchImpl): Promise<string> {
 	while (Date.now() < process.expiresAtMs) {
-		if (ctrl.signal?.aborted) throw new AIError.LoginCancelledError("Login cancelled");
-		const result = await pollSignIn(process, fetchImpl);
+		const result = await pollSignIn(process, ctrl, fetchImpl);
 		switch (result.status) {
 			case "pending":
-				await Bun.sleep(POLL_INTERVAL_SECONDS * 1000);
+				await abortableSleep(
+					Math.min(POLL_INTERVAL_MS, Math.max(0, process.expiresAtMs - Date.now())),
+					ctrl.signal,
+				);
 				break;
 			case "completed":
 				if (result.exchangeToken) return result.exchangeToken;
@@ -188,13 +212,15 @@ async function exchangeForApiKey(
 	process: SignInProcess,
 	exchangeToken: string,
 	codeVerifier: string,
+	ctrl: OAuthController,
 	fetchImpl: FetchImpl,
 ): Promise<string> {
 	const message = "Failed to exchange Mistral sign-in for an API key";
 	const payload = asRecord(
 		await postJson(
-			`${AUTH_API_BASE_URL}${SIGN_IN_PATH}/${process.processId}/exchange`,
+			`${AUTH_API_BASE_URL}${SIGN_IN_PATH}/${encodeURIComponent(process.processId)}/exchange`,
 			{ exchange_token: exchangeToken, code_verifier: codeVerifier },
+			ctrl,
 			fetchImpl,
 			message,
 		),
@@ -203,12 +229,16 @@ async function exchangeForApiKey(
 	return requiredString(payload, "api_key", message);
 }
 
-/** `login "custom" hook="mistral-vibe-sign-in"`: whole-flow login for the Mistral provider. */
-export async function loginMistralVibeSignIn(ctrl: OAuthController): Promise<OAuthCredentials> {
+/**
+ * `login "custom" hook="mistral-vibe-sign-in"`: whole-flow login for the Mistral provider.
+ * Returns the minted key as a string so `/login` stores it as a plain API-key credential.
+ */
+export async function loginMistralVibeSignIn(ctrl: OAuthController): Promise<string> {
+	throwIfCancelled(ctrl.signal);
 	const fetchImpl = ctrl.fetch ?? fetch;
-	const codeVerifier = randomBytes(64).toString("base64url");
-	const codeChallenge = createHash("sha256").update(codeVerifier, "ascii").digest("base64url");
-	const process = await startSignIn(codeChallenge, fetchImpl);
+	const { verifier, challenge } = await generatePKCE();
+	const process = await startSignIn(challenge, ctrl, fetchImpl);
+	throwIfCancelled(ctrl.signal);
 	ctrl.onAuth?.({
 		url: process.signInUrl,
 		instructions: "Sign in with your Mistral account (Pro plan or higher), then return here.",
@@ -216,9 +246,5 @@ export async function loginMistralVibeSignIn(ctrl: OAuthController): Promise<OAu
 	ctrl.onProgress?.("Waiting for Mistral sign-in to complete...");
 	const exchangeToken = await waitForCompletion(process, ctrl, fetchImpl);
 	ctrl.onProgress?.("Exchanging sign-in for a Mistral API key...");
-	const apiKey = await exchangeForApiKey(process, exchangeToken, codeVerifier, fetchImpl);
-	// The refresh token slot carries a sentinel, not a real grant: the key is
-	// durable and there is nothing to refresh. `refresh "none"` in the rule
-	// keeps the engine from ever presenting it.
-	return { access: apiKey, refresh: "mistral-browser-sign-in", expires: Date.now() + CREDENTIAL_EXPIRY_MS };
+	return exchangeForApiKey(process, exchangeToken, verifier, ctrl, fetchImpl);
 }
